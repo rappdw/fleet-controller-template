@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Block until a not-yet-seen message lands in this agent's inbound mailbox
+# directory, then exit 2 with the new filenames on stderr. Run as a Claude Code
+# asyncRewake hook (SessionStart + Stop), exit 2 wakes the idle session.
+# Only one watcher runs at a time; extra invocations exit 0 immediately.
+set -u
+root="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+inbox="$root/in-container-mailbox/${MAILBOX_INBOUND:-codex2claude}"
+state="$root/.claude/mailbox-state"
+mkdir -p "$state"
+seen="$state/seen"
+touch "$seen"
+exec 9>"$state/watch.lock"
+flock -n 9 || exit 0
+while :; do
+  new=$(comm -23 <(ls "$inbox" 2>/dev/null | grep '\.md$' | sort) <(sort -u "$seen"))
+  if [ -n "$new" ]; then
+    echo "$new" >> "$seen"
+    {
+      echo "New in-container-mailbox message(s) in ${inbox#$root/}/:"
+      echo "$new"
+      echo "Read and triage per AGENTS.md (In-container mailbox)."
+    } >&2
+    exit 2
+  fi
+  sleep 2
+done

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Regression checks for bin/lease, run in an isolated temporary workspace.
+# Usage: bin/lease-test   (exits non-zero on the first failure)
+set -u
+L="$(cd "$(dirname "$0")" && pwd)/lease"
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+export CLAUDE_PROJECT_DIR="$W"
+mkdir -p "$W/real"; ln -s real "$W/alias"; ln -s /etc "$W/escape"
+fail=0
+ok()  { if "$@" >/dev/null 2>&1; then echo "pass: $desc"; else echo "FAIL: $desc"; fail=1; fi; }
+bad() { if "$@" >/dev/null 2>&1; then echo "FAIL: $desc"; fail=1; else echo "pass: $desc"; fi; }
+
+desc="acquire dir + file";            t1=$("$L" acquire --agent claude --purpose t docs AGENTS.md) && echo "pass: $desc" || { echo "FAIL: $desc"; fail=1; }
+desc="descendant of leased dir";      bad "$L" acquire --agent codex --purpose t docs/amap.md
+desc="leaf under dir";               ok  "$L" acquire --agent claude --purpose t sub/file.md
+desc="ancestor of leased file";       bad "$L" acquire --agent codex --purpose t sub
+desc="all-or-nothing on conflict";    bad "$L" acquire --agent codex --purpose t README.md AGENTS.md
+desc="  ...nothing partially held";   bad grep -rq README.md "$W/.locks"
+desc="git resource";                  ok  "$L" acquire --agent codex --purpose t git
+desc="git held";                      bad "$L" acquire --agent claude --purpose t git
+desc="file named git is distinct";    ok  "$L" acquire --agent claude --purpose t ./git
+desc="encoded names distinct";        ok  "$L" acquire --agent claude --purpose t a/b a__b a%2Fb
+desc="absolute path rejected";        bad "$L" acquire --agent claude --purpose t /etc/passwd
+desc="traversal rejected";            bad "$L" acquire --agent claude --purpose t ../x
+desc="symlink alias conflicts";       ok  "$L" acquire --agent claude --purpose t real/shared.md
+desc="  ...alias/shared.md refused";  bad "$L" acquire --agent codex --purpose t alias/shared.md
+desc="symlink escape rejected";       bad "$L" acquire --agent codex --purpose t escape/passwd
+desc="nonexistent leaf allowed";      ok  "$L" acquire --agent codex --purpose t new/leaf.md
+desc="wrong token refused";           bad "$L" release codex-000000000000
+desc="release own token";             ok  "$L" release "$t1"
+desc="  ...path free again";          ok  "$L" acquire --agent codex --purpose t docs/amap.md
+desc="list";                          ok  "$L" list
+exit $fail

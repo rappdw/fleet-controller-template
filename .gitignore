@@ -1,0 +1,25 @@
+# Per-agent local configuration and Sandy runtime state
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+.codex/
+.sandy/
+
+# Runtime coordination data is private by default: real mailbox traffic,
+# state records and surveys describe your fleet. Remove these lines only for
+# a private repository you intend to track them in.
+in-container-mailbox/*/*
+!in-container-mailbox/*/.gitkeep
+state/*
+!state/README.md
+surveys/*
+!surveys/.gitkeep
+
+# Cooperative edit leases (bin/lease) and temporary files
+.locks/
+*.tmp
+*.swp
+*~
+.DS_Store
+.env
+.env.*

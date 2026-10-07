@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Queue a short wake message into the live Codex TUI session for this
+# workspace so it starts a turn even when idle. Usage: codex-wake "<text>"
+# The full handoff belongs in in-container-mailbox/claude2codex/; this only
+# points Codex at it. Override the session with CODEX_THREAD=<uuid>.
+#
+# A session counts as live only if a running process holds its rollout file
+# open, its cwd is this workspace and it was started by the Codex TUI. Zero or
+# several matches is an error; resolve with an explicitly verified CODEX_THREAD.
+set -eu
+root="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+msg="${1:?usage: codex-wake \"<message>\"}"
+if [ -z "${CODEX_THREAD:-}" ]; then
+  CODEX_THREAD=$(python3 - "$root" <<'PY'
+import glob, json, os, sys
+root = sys.argv[1]
+sessions = os.path.realpath(os.path.expanduser("~/.codex/sessions"))
+open_files = set()
+for fd in glob.glob("/proc/[0-9]*/fd/*"):
+    try:
+        t = os.readlink(fd)
+    except OSError:
+        continue
+    if t.startswith(sessions + "/") and t.endswith(".jsonl"):
+        open_files.add(t)
+live = []
+for f in sorted(open_files):
+    with open(f) as fh:
+        p = json.loads(fh.readline()).get("payload", {})
+    if p.get("cwd") == root and p.get("originator") == "codex-tui":
+        live.append(p["id"])
+if len(live) != 1:
+    sys.exit(f"codex-wake: expected 1 live Codex TUI session for {root}, found {len(live)}: {live}; "
+             "set CODEX_THREAD to a verified session id")
+print(live[0])
+PY
+)
+fi
+exec codex queue --thread "$CODEX_THREAD" --message "$msg"

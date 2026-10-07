@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# List mailbox messages marked "Reply: required" that have no reply
+# (no file in the opposite directory with "Re: <filename>").
+set -u
+root="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+cd "$root/in-container-mailbox" || exit 0
+for pair in "claude2codex codex2claude" "codex2claude claude2codex"; do
+  set -- $pair
+  for f in "$1"/*.md; do
+    [ -e "$f" ] || continue
+    grep -q '^Reply: required' "$f" || continue
+    grep -lq "^Re: $(basename "$f")" "$2"/*.md 2>/dev/null || echo "unanswered: $f"
+  done
+done

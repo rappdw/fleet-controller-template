@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Fleet status survey over AMAP: send, collect replies, track the operator checklist.
+
+  fleet-survey send    --agent claude|codex [--hours 12] [--to ADDR ...]
+  fleet-survey collect --agent claude|codex [SURVEY_DIR]
+  fleet-survey confirm --agent claude|codex [--dir SURVEY_DIR] --note TEXT MSG_ID...
+  fleet-survey status  [SURVEY_DIR]
+
+send     Sends the status questions, carrying a unique survey token and sent and
+         expires times, to every roster peer except this controller (or only to
+         --to). It writes surveys/<stamp>-<agent>/survey.json before the first
+         submission and updates it after every submission and router result.
+         Uncertain attempts are never resent automatically.
+collect  Owner only. Refreshes pending router outcomes, then classifies spool
+         messages from surveyed addresses:
+           confirmed   the survey token is in the subject or body, within the window
+           late        the token is present but the message arrived after expiry
+           candidates  sender and time match but there is no token; the owner
+                       must confirm these
+         Malformed spool files are quarantined with a diagnostic and never
+         abort collection.
+confirm  Owner only. Moves candidate replies to confirmed, with a note.
+status   Read-only, for any survey: coverage counts confirmed replies only.
+         Shows pending router outcomes without writing them, and how many
+         checklist items the operator has handled.
+
+Writes take a bin/lease lease on the survey directory. SURVEY_DIR defaults to
+the newest survey. The checklist (checklist.md) is written by the survey owner
+following the fleet-survey skill and ticked by the operator; a tick means "handled with
+that agent", not that the underlying task is resolved.
+"""
+import argparse, datetime, glob, json, math, os, re, subprocess, sys, time, uuid
+
+ROOT = os.environ.get("CLAUDE_PROJECT_DIR") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SURVEYS = os.path.join(ROOT, "surveys")
+LEASE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lease")
+SUBMIT = os.environ.get("FLEET_SURVEY_SUBMIT", "/opt/sandy/features/amap/bin/inbox-submit")
+OUTBOX = os.environ.get("AMAP_OUTBOX_DIR", os.path.expanduser("~/.amap/outbox"))
+OPERATOR = os.environ.get("FLEET_OPERATOR", "the operator")  # name shown to surveyed agents
+SPOOLS = [os.environ.get("AMAP_PEER_DIR", os.path.expanduser("~/.amap/peer")),
+          os.environ.get("AMAP_INBOX_DIR", os.path.expanduser("~/.amap/inbox"))]
+
+BODY = """Status survey from the fleet controller ({self_slug}), on behalf of
+{operator}.
+
+Survey token: {token}. Please include it in your reply's subject or first line.
+Sent:    {sent}
+Expires: {expires}. If you read this after that time, ignore it and do not
+         reply; a fresh survey will be sent if needed.
+
+Please reply to this message (reply to this message's id) with short answers.
+Answering is read-only: don't commit, push, stash or otherwise change anything
+in order to answer.
+
+1. Operator action: are you blocked on the operator or waiting for the operator? If so, say
+   exactly what is needed (decision, approval, credentials, review, other),
+   since when, and how the operator can resolve it. Otherwise answer "none".
+2. Current task: one line, plus whether you are working, idle or finished.
+3. Git, for each repo or worktree you're working in: repo path, branch,
+   whether you have uncommitted changes (staged/unstaged/untracked), commits
+   ahead of upstream or no upstream, and any open PR URL or a PR you intend to
+   open.
+4. Next step: one line.
+
+Not a coding agent, or nothing applies? A one-line reply saying so is enough.
+"""
+
+
+def utcnow():
+    fixed = os.environ.get("FLEET_SURVEY_NOW")  # test hook: pin the clock
+    return parse_t(fixed) if fixed else datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_t(s):
+    """Parse an ISO time; raise ValueError on bad or timezone-naive input."""
+    if not isinstance(s, str):
+        raise ValueError(f"not a string: {s!r}")
+    t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        raise ValueError(f"naive timestamp: {s!r}")
+    return t
+
+
+def self_address():
+    with open("/etc/sandy-session.json") as fh:
+        name = json.load(fh)["sandbox_name"]
+    return f"{name}@{os.environ['AMAP_FLEET_DOMAIN']}"
+
+
+def roster():
+    with open(os.path.join(os.environ["AMAP_ROSTER_DIR"], "roster.json")) as fh:
+        r = json.load(fh)
+    interval = float(r.get("interval_s") or 0)
+    age = (utcnow() - parse_t(r["written_at"])).total_seconds()
+    if not interval or age > 3 * interval:
+        print(f"warning: roster may be stale (written_at {r['written_at']}, age {age:.0f}s)", file=sys.stderr)
+    return [m["address"] for m in r["members"]]
+
+
+def survey_dir(arg):
+    if arg:
+        d = os.path.realpath(arg)
+    else:
+        dirs = sorted(d for d in glob.glob(os.path.join(SURVEYS, "*")) if os.path.isdir(d))
+        if not dirs:
+            sys.exit("fleet-survey: no surveys yet")
+        d = dirs[-1]
+    if not os.path.exists(os.path.join(d, "survey.json")):
+        sys.exit(f"fleet-survey: not a survey directory: {d}")
+    return d
+
+
+def load(d, name, default=None):
+    p = os.path.join(d, name)
+    if not os.path.exists(p):
+        return default
+    with open(p) as fh:
+        return json.load(fh)
+
+
+def save(d, name, obj):
+    tmp = os.path.join(d, name + ".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, os.path.join(d, name))
+
+
+class SurveyLease:
+    """Hold a bin/lease lease on a survey directory for the duration of a write."""
+
+    def __init__(self, agent, d):
+        self.agent, self.rel, self.token = agent, os.path.relpath(d, ROOT), None
+
+    def __enter__(self):
+        p = subprocess.run([LEASE, "acquire", "--agent", self.agent, "--purpose", "fleet-survey write", self.rel],
+                           text=True, capture_output=True)
+        if p.returncode:
+            sys.exit(f"fleet-survey: cannot lease {self.rel}: {p.stderr.strip()}")
+        self.token = p.stdout.strip()
+        return self
+
+    def __exit__(self, *exc):
+        subprocess.run([LEASE, "release", self.token], capture_output=True)
+
+
+def require_owner(s, agent, d):
+    if s.get("owner") != agent:
+        sys.exit(f"fleet-survey: {os.path.relpath(d, ROOT)} is owned by {s.get('owner')}; "
+                 f"ask the owner through the in-container mailbox or get an explicit handoff")
+
+
+def refresh_outcomes(recips):
+    """Fill in router results for submitted requests. Returns the number still pending."""
+    pending = 0
+    for r in recips:
+        if r.get("req_id") and not r.get("outcome"):
+            res = os.path.join(OUTBOX, "results", f"{r['req_id']}.json")
+            try:
+                with open(res) as fh:
+                    x = json.load(fh)
+                r.update(outcome=x.get("outcome"), reason_code=x.get("reason_code"),
+                         message_id=x.get("message_id"), routed_at=x.get("ts"))
+            except (OSError, ValueError):
+                pending += 1
+    return pending
+
+
+def send(args):
+    if not (math.isfinite(args.hours) and args.hours > 0):
+        sys.exit("fleet-survey: --hours must be a positive finite number")
+    me = self_address()
+    to = list(dict.fromkeys(args.to or [a for a in roster() if a != me]))
+    if me in to:
+        sys.exit("fleet-survey: refusing to survey this controller itself")
+    now = utcnow()
+    stamp = now.strftime("%Y-%m-%dT%H%M%SZ")
+    # Random part keeps tokens unique across owners and same-second sends; never reissued.
+    token = f"fs-{stamp.replace('-', '')}-{uuid.uuid4().hex[:12]}"
+    sent, expires = iso(now), iso(now + datetime.timedelta(hours=args.hours))
+    d = os.path.join(SURVEYS, f"{stamp}-{args.agent}")
+    os.makedirs(d)
+    with SurveyLease(args.agent, d):
+        body = BODY.format(self_slug=me.split("@")[0], operator=OPERATOR, token=token, sent=sent, expires=expires)
+        with open(os.path.join(d, "body.txt"), "w") as fh:
+            fh.write(body)
+        subject = f"status-survey {token} (sent {sent}, expires {expires})"
+        recips = [{"address": a, "state": "not-yet-attempted"} for a in to]
+        survey = {"owner": args.agent, "token": token, "sent": sent, "expires": expires,
+                  "subject": subject, "recipients": recips}
+        save(d, "survey.json", survey)
+        for r in recips:
+            r["state"] = "attempting"
+            save(d, "survey.json", survey)
+            p = subprocess.run([SUBMIT, "submit", "--to", r["address"], "--subject", subject], input=body,
+                               text=True, capture_output=True, env={**os.environ, "OUTBOX_DIR": OUTBOX})
+            m = re.search(r"Submitted request (\S+)", p.stdout)
+            if p.returncode == 0 and m:
+                r.update(state="submitted", req_id=m.group(1))
+            else:
+                # Uncertain: the request may or may not be in the drop-box. Never auto-resend.
+                r.update(state="uncertain", returncode=p.returncode, error=(p.stdout + p.stderr).strip()[:500])
+            save(d, "survey.json", survey)
+        deadline = time.time() + float(os.environ.get("FLEET_SURVEY_WAIT_S", "60"))
+        while refresh_outcomes(recips) and time.time() < deadline:
+            save(d, "survey.json", survey)
+            time.sleep(2)
+        save(d, "survey.json", survey)
+    counts = {}
+    for r in recips:
+        k = r.get("outcome") or r["state"]
+        counts[k] = counts.get(k, 0) + 1
+    print(f"survey: {os.path.relpath(d, ROOT)}\nsubject: {subject}\nresults: {counts}")
+
+
+def read_spool():
+    """Yield (path, message dict | None, diagnostic | None) for every spool file."""
+    for spool in SPOOLS:
+        for p in sorted(glob.glob(os.path.join(spool, "messages", "*.json"))):
+            try:
+                with open(p) as fh:
+                    m = json.load(fh)
+            except (OSError, ValueError) as e:
+                yield p, None, f"unreadable JSON: {e}"
+                continue
+            if not isinstance(m, dict):
+                yield p, None, "not a JSON object"
+                continue
+            for k in ("id", "from", "date"):
+                if not isinstance(m.get(k), str) or not m.get(k):
+                    yield p, None, f"missing or non-string {k!r}"
+                    break
+            else:
+                for k in ("subject", "body_text"):
+                    if m.get(k) is not None and not isinstance(m.get(k), str):
+                        yield p, None, f"non-string {k!r}"
+                        break
+                else:
+                    try:
+                        parse_t(m["date"])
+                    except ValueError as e:
+                        yield p, None, f"bad date: {e}"
+                        continue
+                    yield p, m, None
+
+
+def collect(args):
+    d = survey_dir(args.dir)
+    s = load(d, "survey.json")
+    require_owner(s, args.agent, d)
+    with SurveyLease(args.agent, d):
+        s = load(d, "survey.json")
+        still_pending = refresh_outcomes(s["recipients"])
+        save(d, "survey.json", s)
+        lo, hi, token = parse_t(s["sent"]), parse_t(s["expires"]), s.get("token")
+        want = {r["address"] for r in s["recipients"]}
+        rep = load(d, "replies.json", {})
+        for k in ("confirmed", "late", "candidates"):
+            rep.setdefault(k, {})
+        rep.setdefault("quarantined", [])
+        known = {e["id"] for b in ("confirmed", "late", "candidates") for v in rep[b].values() for e in v}
+        quarantined = {q["file"] for q in rep["quarantined"]}
+        new = []
+        for path, m, diag in read_spool():
+            if diag:
+                if path not in quarantined:
+                    rep["quarantined"].append({"file": path, "reason": diag})
+                    quarantined.add(path)
+                    print(f"quarantined {path}: {diag}", file=sys.stderr)
+                continue
+            if m["from"] not in want or m["id"] in known:
+                continue
+            t = parse_t(m["date"])
+            has_token = bool(token) and token in ((m.get("subject") or "") + "\n" + (m.get("body_text") or ""))
+            if has_token and lo <= t <= hi:
+                bucket = "confirmed"
+            elif has_token and t > hi:
+                bucket = "late"
+            elif not has_token and lo <= t <= hi:
+                bucket = "candidates"
+            else:
+                continue
+            e = {"id": m["id"], "date": m["date"], "subject": m.get("subject"), "body_text": m.get("body_text"),
+                 "file": path, "match": "token" if has_token else "sender+window"}
+            rep[bucket].setdefault(m["from"], []).append(e)
+            known.add(m["id"])
+            new.append((bucket, m["from"], e))
+        for b in ("confirmed", "late", "candidates"):
+            for v in rep[b].values():
+                v.sort(key=lambda e: e["date"])
+        save(d, "replies.json", rep)
+    print(f"survey: {os.path.relpath(d, ROOT)}; confirmed {len(rep['confirmed'])}/{len(want)} agents; "
+          f"candidates {sum(map(len, rep['candidates'].values()))}; late {sum(map(len, rep['late'].values()))}; "
+          f"quarantined {len(rep['quarantined'])}; router results pending {still_pending}; {len(new)} new")
+    for bucket, frm, e in sorted(new, key=lambda x: x[2]["date"]):
+        print(f"\n=== [{bucket}] {frm}  id={e['id']}  {e['date']}\n{e['body_text']}")
+
+
+def confirm(args):
+    d = survey_dir(args.dir)
+    s = load(d, "survey.json")
+    require_owner(s, args.agent, d)
+    with SurveyLease(args.agent, d):
+        rep = load(d, "replies.json", {})
+        cands = rep.get("candidates", {})
+        for mid in args.ids:
+            hit = next(((frm, e) for frm, v in cands.items() for e in v if e["id"] == mid), None)
+            if not hit:
+                print(f"not a candidate: {mid}", file=sys.stderr)
+                continue
+            frm, e = hit
+            cands[frm].remove(e)
+            if not cands[frm]:
+                del cands[frm]
+            e.update(match="owner-confirmed", confirmed_by=args.agent, confirmed_at=iso(utcnow()), note=args.note)
+            rep.setdefault("confirmed", {}).setdefault(frm, []).append(e)
+            print(f"confirmed {mid} from {frm}")
+        save(d, "replies.json", rep)
+
+
+def status(args):
+    d = survey_dir(args.dir)
+    s = load(d, "survey.json")
+    rep = load(d, "replies.json", {})
+    recips = [dict(r) for r in s["recipients"]]
+    pending = refresh_outcomes(recips)  # read-only: not written back
+    want = [r["address"] for r in recips]
+    expired = utcnow() > parse_t(s["expires"])
+    print(f"survey: {os.path.relpath(d, ROOT)} owner {s.get('owner')} token {s.get('token')}\n"
+          f"sent {s['sent']} expires {s['expires']}{' (EXPIRED)' if expired else ''}")
+    outcomes = {}
+    for r in recips:
+        k = r.get("outcome") or r.get("state", "unknown")
+        outcomes[k] = outcomes.get(k, 0) + 1
+    print(f"router: {outcomes}" + (f" ({pending} awaiting a result)" if pending else ""))
+    conf = rep.get("confirmed", {})
+    print(f"confirmed replies: {len(conf)}/{len(want)} agents")
+    for b in ("candidates", "late"):
+        if rep.get(b):
+            print(f"{b}: " + ", ".join(f"{a.split('@')[0]} ({len(v)})" for a, v in rep[b].items()))
+    if rep.get("quarantined"):
+        print(f"quarantined spool files: {len(rep['quarantined'])}")
+    silent = [a.split("@")[0] for a in want if a not in conf and a not in rep.get("candidates", {})]
+    if silent:
+        print("silent: " + ", ".join(silent))
+    ck = os.path.join(d, "checklist.md")
+    if not os.path.exists(ck):
+        print("checklist: not written yet")
+        return
+    agent, items = None, {}
+    with open(ck) as fh:
+        for line in fh:
+            if line.startswith("## "):
+                agent = line[3:].split()[0]
+            m = re.match(r"\s*- \[( |x|X)\] (.*)", line)
+            if m and agent:
+                items.setdefault(agent, []).append((m.group(1) != " ", m.group(2).strip()))
+    done = sum(ok for v in items.values() for ok, _ in v)
+    total = sum(len(v) for v in items.values())
+    print(f"checklist: {done}/{total} items handled")
+    for a, v in items.items():
+        open_ = [t for ok, t in v if not ok]
+        if open_:
+            print(f"\n{a} ({len(open_)} not yet handled)")
+            for t in open_:
+                print(f"  - [ ] {t}")
+
+
+p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+sub = p.add_subparsers(dest="cmd", required=True)
+a = sub.add_parser("send")
+a.add_argument("--agent", required=True, choices=["claude", "codex"])
+a.add_argument("--hours", type=float, default=12)
+a.add_argument("--to", nargs="+")
+a.set_defaults(fn=send)
+c = sub.add_parser("collect")
+c.add_argument("--agent", required=True, choices=["claude", "codex"])
+c.add_argument("dir", nargs="?")
+c.set_defaults(fn=collect)
+f = sub.add_parser("confirm")
+f.add_argument("--agent", required=True, choices=["claude", "codex"])
+f.add_argument("--dir")
+f.add_argument("--note", required=True)
+f.add_argument("ids", nargs="+")
+f.set_defaults(fn=confirm)
+st = sub.add_parser("status")
+st.add_argument("dir", nargs="?")
+st.set_defaults(fn=status)
+args = p.parse_args()
+args.fn(args)

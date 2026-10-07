@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Cooperative leases on shared workspace paths (see AGENTS.md, C2).
+
+  lease acquire --agent claude|codex --purpose TEXT RESOURCE...   prints a token
+  lease release TOKEN                                             releases that token's leases
+  lease list                                                      shows current leases
+
+RESOURCE is a repository-relative path (file or directory) or the reserved id
+"git" (the Git index/commit lease). A directory lease conflicts with leases on
+anything beneath it, and vice versa. Acquisition is all-or-nothing for the
+whole set, serialised by a flock on .locks/.mutex. There is deliberately no
+force-break: a lease older than 15 minutes is only *potentially* stale; ask its
+holder through the mailbox, then the operator.
+"""
+import argparse, datetime, fcntl, json, os, sys, uuid
+from urllib.parse import quote, unquote
+
+ROOT = os.environ.get("CLAUDE_PROJECT_DIR") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+LOCKS = os.path.join(ROOT, ".locks")
+STALE_S = 15 * 60
+
+
+def canon(resource):
+    # Leases are keyed by the resolved target: symlinks in existing components
+    # (and the leaf, if it exists) are followed, so an alias and its target
+    # conflict, and anything resolving outside the workspace is rejected.
+    # Changing a symlink itself is not covered; agree that scope separately.
+    if resource == "git":
+        return ("res", "git")
+    if os.path.isabs(resource):
+        sys.exit(f"lease: absolute path not allowed: {resource}")
+    root = os.path.realpath(ROOT)
+    target = os.path.realpath(os.path.join(root, resource))
+    rel = os.path.relpath(target, root)
+    if rel == "." or rel == ".." or rel.startswith("../"):
+        sys.exit(f"lease: path outside the workspace: {resource}")
+    return ("path", rel)
+
+
+def dirname_for(kind, name):
+    return os.path.join(LOCKS, f"{kind}:{quote(name, safe='')}")
+
+
+def conflicts(a, b):
+    (ka, na), (kb, nb) = a, b
+    if ka != kb:
+        return False
+    if ka == "res":
+        return na == nb
+    return na == nb or na.startswith(nb + "/") or nb.startswith(na + "/")
+
+
+def current():
+    out = []
+    for d in sorted(os.listdir(LOCKS)) if os.path.isdir(LOCKS) else []:
+        if ":" not in d:
+            continue
+        kind, enc = d.split(":", 1)
+        try:
+            with open(os.path.join(LOCKS, d, "owner")) as fh:
+                owner = json.load(fh)
+        except (OSError, ValueError):
+            owner = {}
+        out.append(((kind, unquote(enc)), d, owner))
+    return out
+
+
+def mutex():
+    os.makedirs(LOCKS, exist_ok=True)
+    fh = open(os.path.join(LOCKS, ".mutex"), "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def age(owner):
+    try:
+        t = datetime.datetime.fromisoformat(owner["time"].replace("Z", "+00:00"))
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except (KeyError, ValueError):
+        return None
+
+
+def describe(res, owner):
+    a = age(owner)
+    stale = " POTENTIALLY STALE" if a is not None and a > STALE_S else ""
+    return (f"{res[0]}:{res[1]} held by {owner.get('agent', '?')} since {owner.get('time', '?')}"
+            f"{stale} (purpose: {owner.get('purpose', '?')})")
+
+
+def acquire(args):
+    wanted = sorted({canon(r) for r in args.resources})
+    with mutex():
+        held = current()
+        clashes = [(w, res, o) for w in wanted for res, _, o in held if conflicts(w, res)]
+        if clashes:
+            for w, res, o in clashes:
+                print(f"lease: {w[0]}:{w[1]} conflicts with {describe(res, o)}", file=sys.stderr)
+            sys.exit(1)
+        token = f"{args.agent}-{uuid.uuid4().hex[:12]}"
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        made = []
+        try:
+            for kind, name in wanted:
+                d = dirname_for(kind, name)
+                os.mkdir(d)
+                made.append(d)
+                with open(os.path.join(d, "owner"), "w") as fh:
+                    json.dump({"agent": args.agent, "token": token, "time": now,
+                               "purpose": args.purpose, "resource": f"{kind}:{name}"}, fh)
+        except OSError as e:
+            for d in made:
+                for f in os.listdir(d):
+                    os.unlink(os.path.join(d, f))
+                os.rmdir(d)
+            sys.exit(f"lease: acquire failed, nothing held: {e}")
+    print(token)
+
+
+def release(args):
+    with mutex():
+        mine = [(res, d) for res, d, o in current() if o.get("token") == args.token]
+        if not mine:
+            sys.exit(f"lease: no leases held with token {args.token}")
+        for res, d in mine:
+            path = os.path.join(LOCKS, d)
+            for f in os.listdir(path):
+                os.unlink(os.path.join(path, f))
+            os.rmdir(path)
+            print(f"released {res[0]}:{res[1]}")
+
+
+def list_(_):
+    with mutex():
+        held = current()
+    if not held:
+        print("no leases held")
+    for res, _, o in held:
+        print(describe(res, o))
+
+
+p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+sub = p.add_subparsers(dest="cmd", required=True)
+a = sub.add_parser("acquire")
+a.add_argument("--agent", required=True, choices=["claude", "codex"])
+a.add_argument("--purpose", required=True)
+a.add_argument("resources", nargs="+")
+a.set_defaults(fn=acquire)
+r = sub.add_parser("release")
+r.add_argument("token")
+r.set_defaults(fn=release)
+sub.add_parser("list").set_defaults(fn=list_)
+args = p.parse_args()
+args.fn(args)

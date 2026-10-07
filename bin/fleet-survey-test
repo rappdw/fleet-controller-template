@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Regression checks for bin/fleet-survey in an isolated fixture: a fake roster,
+# a fake inbox-submit, a fake outbox and spools. No AMAP traffic is sent.
+# Usage: bin/fleet-survey-test   (exits non-zero if any check fails)
+set -u
+BIN="$(cd "$(dirname "$0")" && pwd)"; FS="$BIN/fleet-survey"
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+export CLAUDE_PROJECT_DIR="$W" AMAP_FLEET_DOMAIN=test.invalid FLEET_SURVEY_WAIT_S=2
+export AMAP_ROSTER_DIR="$W/roster" AMAP_OUTBOX_DIR="$W/outbox" AMAP_PEER_DIR="$W/peer" AMAP_INBOX_DIR="$W/inbox"
+export FLEET_SURVEY_SUBMIT="$W/fake-submit"
+mkdir -p "$W/roster" "$W/outbox/results" "$W/peer/messages" "$W/inbox/messages"
+SELF="$(python3 -c 'import json;print(json.load(open("/etc/sandy-session.json"))["sandbox_name"])')@test.invalid"
+A=ok-a@test.invalid B=fail-b@test.invalid C=slow-c@test.invalid
+python3 - "$W" "$SELF" "$A" "$B" "$C" <<'PY'
+import json, sys, datetime
+w, *addrs = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump({"written_at": now, "interval_s": 5, "members": [{"address": a, "state": "admitted"} for a in addrs]},
+          open(f"{w}/roster/roster.json", "w"))
+PY
+cat > "$W/fake-submit" <<'SH'
+#!/usr/bin/env bash
+# fake inbox-submit: "fail" addresses error out, "slow" addresses get no router result
+to=""; while [ $# -gt 0 ]; do [ "$1" = --to ] && to="$2"; shift; done; cat >/dev/null
+case "$to" in fail-*) echo "boom" >&2; exit 1;; esac
+n=$(ls "$OUTBOX_DIR"/req-* 2>/dev/null | wc -l); id=$(printf '%08d' "$n"); touch "$OUTBOX_DIR/req-$id"
+case "$to" in slow-*) ;; *) printf '{"outcome":"accepted","reason_code":"peer_routed","message_id":"m%s","ts":"x"}' "$id" > "$OUTBOX_DIR/results/$id.json";; esac
+echo "Submitted request $id to the relay drop-box"
+SH
+chmod +x "$W/fake-submit"
+fail=0
+check() { local desc="$1"; shift; if "$@" >/dev/null 2>&1; then echo "pass: $desc"; else echo "FAIL: $desc"; fail=1; fi; }
+not()   { ! "$@"; }
+J() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(eval(sys.argv[2]))" "$@"; }
+
+check "rejects --hours 0"            not "$FS" send --agent claude --hours 0
+check "rejects --hours nan"          not "$FS" send --agent claude --hours nan
+check "send runs"                    "$FS" send --agent claude --hours 1 --to "$A" "$A" "$B" "$C"
+D=$(ls -d "$W"/surveys/*-claude | tail -1); S="$D/survey.json"
+check "recipients deduplicated"      test "$(J "$S" 'len(d["recipients"])')" = 3
+check "token recorded"               test -n "$(J "$S" 'd["token"]')"
+check "sent time has seconds"        grep -qE '"sent": "[0-9-]+T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"' "$S"
+check "failed submit is uncertain"   test "$(J "$S" '[r["state"] for r in d["recipients"] if r["address"].startswith("fail")][0]')" = uncertain
+check "accepted outcome persisted"   test "$(J "$S" '[r.get("outcome") for r in d["recipients"] if r["address"].startswith("ok")][0]')" = accepted
+check "slow result still pending"    test "$(J "$S" '[r.get("outcome") for r in d["recipients"] if r["address"].startswith("slow")][0]')" = None
+check "no lease left behind"         not test -d "$W/.locks/path:surveys%2F$(basename "$D")"
+
+TOK=$(J "$S" 'd["token"]'); NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+msg() { printf '%s' "$2" > "$W/peer/messages/$1.json"; }
+msg r1 "{\"id\":\"r1\",\"from\":\"$A\",\"date\":\"$NOW\",\"subject\":\"Re: $TOK\",\"body_text\":\"none\"}"
+msg u1 "{\"id\":\"u1\",\"from\":\"$A\",\"date\":\"$NOW\",\"subject\":\"other task\",\"body_text\":\"unrelated\"}"
+msg l1 "{\"id\":\"l1\",\"from\":\"$C\",\"date\":\"2099-01-01T00:00:00Z\",\"subject\":\"$TOK\",\"body_text\":\"late\"}"
+msg x1 "{\"id\":\"x1\",\"from\":\"$C\",\"date\":\"$NOW\",\"subject\":\"$TOK\",\"body_text\":\"stranger\"}"
+msg q1 "{\"id\":\"q1\",\"from\":\"$A\",\"date\":\"not-a-date\",\"subject\":\"$TOK\"}"
+msg q2 "[1,2,3]"
+msg q3 "{\"from\":\"$A\",\"date\":\"$NOW\",\"subject\":\"$TOK\"}"
+msg q4 "{\"id\":\"q4\",\"from\":\"$A\",\"date\":\"2026-10-07T15:00:00\",\"subject\":\"$TOK\"}"
+msg q5 "{\"id\":\"q5\",\"from\":\"$A\",\"date\":\"$NOW\",\"subject\":42}"
+msg n1 "{\"id\":\"n1\",\"from\":\"nobody@test.invalid\",\"date\":\"$NOW\",\"subject\":\"$TOK\"}"
+R="$D/replies.json"
+
+check "non-owner collect refused"    not "$FS" collect --agent codex "$D"
+check "collect survives bad spool"   "$FS" collect --agent claude "$D"
+check "token reply confirmed"        test "$(J "$R" 'sorted(e["id"] for v in d["confirmed"].values() for e in v)')" = "['r1', 'x1']"
+check "untokened msg is candidate"   test "$(J "$R" '[e["id"] for v in d["candidates"].values() for e in v]')" = "['u1']"
+check "post-expiry token is late"    test "$(J "$R" '[e["id"] for v in d["late"].values() for e in v]')" = "['l1']"
+check "5 files quarantined"          test "$(J "$R" 'len(d["quarantined"])')" = 5
+check "non-recipient ignored"        not grep -q '"n1"' "$R"
+"$FS" collect --agent claude "$D" >/dev/null 2>&1
+check "re-collect adds no duplicates" test "$(J "$R" 'sum(len(v) for b in ("confirmed","late","candidates") for v in d[b].values())')" = 4
+
+printf '{"outcome":"accepted","reason_code":"peer_routed","message_id":"mc","ts":"x"}' > "$W/outbox/results/00000001.json"
+H=$(sha256sum "$S")
+check "status shows refreshed outcome" bash -c "'$FS' status '$D' | grep -q \"'accepted': 2\""
+check "status is read-only"          test "$(sha256sum "$S")" = "$H"
+"$FS" collect --agent claude "$D" >/dev/null 2>&1
+check "collect persists the outcome" test "$(J "$S" '[r.get("outcome") for r in d["recipients"] if r["address"].startswith("slow")][0]')" = accepted
+
+check "non-owner confirm refused"    not "$FS" confirm --agent codex --dir "$D" --note x u1
+check "owner confirms candidate"     "$FS" confirm --agent claude --dir "$D" --note "answers the questions" u1
+check "  ...moved to confirmed"      test "$(J "$R" '"u1" in [e["id"] for v in d["confirmed"].values() for e in v] and not d["candidates"]')" = True
+
+T=$("$BIN/lease" acquire --agent codex --purpose test "surveys/$(basename "$D")")
+check "collect blocked by others' lease" not "$FS" collect --agent claude "$D"
+"$BIN/lease" release "$T" >/dev/null
+
+printf '# c\n## ok-a\n- [x] did it\n- [ ] not yet\n' > "$D/checklist.md"
+check "checklist counts handled"     bash -c "'$FS' status '$D' | grep -q '1/2 items handled'"
+# Same-second surveys by different owners: distinct tokens, no cross-confirmation
+export FLEET_SURVEY_NOW=2026-10-07T16:00:00Z
+"$FS" send --agent claude --hours 1 --to "$A" >/dev/null 2>&1
+"$FS" send --agent codex --hours 1 --to "$A" >/dev/null 2>&1
+DC="$W/surveys/2026-10-07T160000Z-claude"; DX="$W/surveys/2026-10-07T160000Z-codex"
+TC=$(J "$DC/survey.json" 'd["token"]'); TX=$(J "$DX/survey.json" 'd["token"]')
+check "same-second tokens differ"    test -n "$TC" -a -n "$TX" -a "$TC" != "$TX"
+rm -f "$W"/peer/messages/*.json
+msg k1 "{\"id\":\"k1\",\"from\":\"$A\",\"date\":\"2026-10-07T16:05:00Z\",\"subject\":\"Re: $TC\",\"body_text\":\"for claude\"}"
+"$FS" collect --agent claude "$DC" >/dev/null 2>&1; "$FS" collect --agent codex "$DX" >/dev/null 2>&1
+check "reply confirmed in its survey" test "$(J "$DC/replies.json" '[e["id"] for v in d["confirmed"].values() for e in v]')" = "['k1']"
+check "  ...not confirmed in the other" test "$(J "$DX/replies.json" 'sum(len(v) for v in d["confirmed"].values())')" = 0
+check "  ...only a candidate there"  test "$(J "$DX/replies.json" '[e["id"] for v in d["candidates"].values() for e in v]')" = "['k1']"
+unset FLEET_SURVEY_NOW
+exit $fail
